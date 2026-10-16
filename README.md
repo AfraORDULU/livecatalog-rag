@@ -1,1 +1,1 @@
-#LiveCatalogRAG: Hibrit E-Ticaret Dstek Asistanı
+#LiveCatalogRAG: Hibrit E-Ticaret Destek Asistanı
