@@ -5,3 +5,4 @@ langchain-community
 google-genai
 python-dotenv
 gradio
+langchain-text-splitters
