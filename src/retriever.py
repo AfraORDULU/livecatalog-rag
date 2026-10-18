@@ -1,141 +1,120 @@
-import os       # İşletim sistemi dosya yollarını yönetmek için
-import sqlite3  # Ürün stok ve fiyatlarının tutulduğu SQLite veritabanına bağlanmak için
+import os
+import sqlite3
+from typing import List, Dict, Any
 
-# LangChain kütüphanesinden Hugging Face embedding sarmalayıcısı:
-# Metinleri anlamsal sayılara (vektörlere) çeviren modeli yerel çalıştırmak için kullanılır.
 from langchain_community.embeddings import HuggingFaceEmbeddings
-
-# Daha önce ingest_docs.py ile diske kaydettiğimiz ChromaDB vektör tabanını okumak için
 from langchain_community.vectorstores import Chroma
 
-
-#DOSYA YOLLARI VE EMBEDDING MODEL TANIMLAMALARI
-
-# ingest_docs.py çalıştırıldığında vektörlerin yazıldığı klasörün adı
-CHROMA_PERSIST_DIR = "chroma_db"
-
-# Ürünlerin fiyat ve stok bilgilerini tutan SQLite dosyasının yolu ("data/products.db")
-DB_PATH = os.path.join("data", "products.db")
-
-# DİKKAT: Dokümanları vektörleştirirken hangi modeli kullandıysak,
-# arama yaparken de BİREBİR AYNI modeli kullanmak zorundayız.
-# Aksi takdirde üretilen vektör uzayları uyuşmaz ve semantik arama çalışmaz.
+# ---------------------------------------------------------
+# 1. DOSYA YOLLARI
+# ---------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "data", "products.db")
+CHROMA_PERSIST_DIR = os.path.join(BASE_DIR, "chroma_db")
 EMBEDDING_MODEL_NAME = "sentence-transformers/distiluse-base-multilingual-cased-v1"
 
-
-# CHROMADB VEKTÖR TABANININ YÜKLENMESİ (RAG MOTORU)
-
-
-# Hugging Face modelini hafızaya alıyoruz (CPU üzerinde çalışacak şekilde)
-print("🧠 Embedding modeli arama için hafızaya alınıyor...")
-embeddings = HuggingFaceEmbeddings(
-    model_name=EMBEDDING_MODEL_NAME,
-    model_kwargs={"device": "cpu"} # Modeli işlemcide (CPU) çalıştırır.
-)
-
-# Önceden diske kaydedilmiş ChromaDB veritabanını belleğe yüklüyoruz.
-# persist_directory: Vektör dosyalarının bulunduğu klasör
-# embedding_function: Kullanıcı bir soru sorduğunda o soruyu anında vektöre çevirecek model
-vector_store = Chroma(
-    persist_directory=CHROMA_PERSIST_DIR,
-    embedding_function=embeddings
-)
+# ---------------------------------------------------------
+# 2. VEKTÖR TABANI (CHROMA) - PDF ARAMA FONKSİYONU
+# ---------------------------------------------------------
+_embeddings = None
+_vector_store = None
 
 
-def search_policy_documents(query: str, n_results: int = 2):
+def get_vector_store():
+    global _embeddings, _vector_store
+    if _vector_store is None:
+        _embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL_NAME,
+            model_kwargs={"device": "cpu"}
+        )
+        _vector_store = Chroma(
+            persist_directory=CHROMA_PERSIST_DIR,
+            embedding_function=_embeddings
+        )
+    return _vector_store
+
+
+def search_policy_documents(query: str, n_results: int = 3, **kwargs) -> List[Dict[str, Any]]:
     """
-    RAG (Retrieval) Fonksiyonu:
-    Kullanıcının doğal dilde yazdığı kural/politika sorusunu alır.
-    ChromaDB içinde semantik (anlamsal kosinüs benzerliği) arama yapar.
-    En alakalı 'n_results' adet metin parçasını ve kaynak dosya bilgisini döndürür.
-    
-    Örnek Sorgu: "Kulaklık jelatini açılırsa iade olur mu?"
+    Kullanıcı sorusuyla anlamsal olarak en yakın Teknosa politika metinlerini getirir.
     """
-    # similarity_search fonksiyonu arka planda iki iş yapar:
-    # 1. 'query' cümlesini embedding modeline verip vektörünü çıkartır.
-    # 2. ChromaDB'deki tüm parçalarla kosinüs benzerliğini hesaplayıp en yakın 'k' tanesini seçer.
-    matched_docs = vector_store.similarity_search(query, k=n_results)
-    
-    results = []
-    for doc in matched_docs:
-        results.append({
-            "content": doc.page_content,                          # İlgili metin parçası (paragraf)
-            "source": doc.metadata.get("source", "Bilinmeyen Doküman")  # Parçanın geldiği dosya (örn: iade_politikasi.md)
-        })
-    return results
+    try:
+        store = get_vector_store()
+        results = store.similarity_search(query, k=n_results)
+        
+        extracted_docs = []
+        for doc in results:
+            extracted_docs.append({
+                "content": doc.page_content,
+                "source": doc.metadata.get("source", "teknosa_belgesi.pdf")
+            })
+        return extracted_docs
+    except Exception as e:
+        print(f"⚠️ ChromaDB sorgulama hatası: {e}")
+        return []
 
 
-
-# SQL VERİTABANI ARAMASI (DİNAMİK ÜRÜN MOTORU)
-
-
-def search_products_db(keyword: str):
+# ---------------------------------------------------------
+# 3. İLİŞKİSEL VERİTABANI (SQLITE) - ÜRÜN ARAMA FONKSİYONU
+# ---------------------------------------------------------
+def search_products_db(keyword: str) -> List[Dict[str, Any]]:
     """
     SQL Arama Fonksiyonu:
-    Kullanıcının ilgilendiği ürün, marka veya kategoriyi SQLite veritabanında arar.
-    Anlık stok, fiyat ve hızlı teslimat şehirlerini liste olarak döndürür.
-    
-    Örnek Sorgu: "kulaklık", "sony", "laptop", "iphone"
+    Türkçe ve İngilizce eşleşmeleri hesaba katarak katalogda arama yapar.
     """
-    # Veritabanına bağlantı aç
+    if not keyword or not keyword.strip():
+        return []
+
+    if not os.path.exists(DB_PATH):
+        return []
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # SQL 'LIKE' araması için aranan kelimenin sağına ve soluna '%' işareti koyuyoruz.
-    # Bu sayede kelime cümlenin veya ürün adının neresinde geçerse geçsin eşleşir.
-    search_term = f"%{keyword}%"
-    
-    # name, category veya specs (teknik özellikler) sütunlarında esnek arama yapıyoruz:
-    query = """
+    term_map = {
+        "kulaklık": ["headphone", "earphone", "headset", "audio", "kulaklık"],
+        "telefon": ["phone", "mobile", "smartphone", "telefon"],
+        "bilgisayar": ["laptop", "computer", "notebook", "pc", "bilgisayar"],
+        "saat": ["watch", "smartwatch", "saat"],
+        "hoparlör": ["speaker", "soundbar", "hoparlör"],
+        "kablo": ["cable", "usb", "kablo"],
+        "şarj": ["charger", "adapter", "şarj"],
+        "apple": ["apple", "iphone", "ipad", "macbook"],
+        "samsung": ["samsung", "galaxy"],
+        "sony": ["sony"]
+    }
+
+    cleaned_kw = keyword.lower().strip()
+    search_terms = term_map.get(cleaned_kw, [cleaned_kw])
+
+    conditions = []
+    params = []
+    for term in search_terms:
+        like_pattern = f"%{term}%"
+        conditions.append("(name LIKE ? OR category LIKE ? OR brand LIKE ? OR specs LIKE ?)")
+        params.extend([like_pattern, like_pattern, like_pattern, like_pattern])
+
+    where_clause = " OR ".join(conditions)
+    query = f"""
     SELECT name, category, brand, price, stock, fast_delivery_cities, specs
     FROM products
-    WHERE name LIKE ? OR category LIKE ? OR specs LIKE ?
+    WHERE {where_clause}
+    LIMIT 6
     """
-    
-    # Güvenlik standardı: SQL Injection açıklarını önlemek için parametreleri tuple olarak geçiyoruz
-    cursor.execute(query, (search_term, search_term, search_term))
+
+    cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
-    
-    # Bağlantıyı kapatıp kaynakları serbest bırakıyoruz
     conn.close()
 
-    # Dönen ham SQL satırlarını okunabilir bir Python sözlük (dictionary) listesine çeviriyoruz
     products = []
     for row in rows:
         products.append({
-            "name": row[0],                  # Ürün adı
-            "category": row[1],              # Kategori
-            "brand": row[2],                 # Marka
-            "price": row[3],                 # Fiyat (TL)
-            "stock": row[4],                 # Anlık stok adedi
-            "fast_delivery_cities": row[5],  # Hızlı kargonun geçerli olduğu şehirler
-            "specs": row[6]                  # Teknik özellikler
+            "name": row[0],
+            "category": row[1],
+            "brand": row[2],
+            "price": row[3],
+            "stock": row[4],
+            "fast_delivery_cities": row[5],
+            "specs": row[6]
         })
     return products
-
-
-# 4. KENDİNİ TEST ETME BLOĞU (LOCAL TEST)
-
-# Bu dosya doğrudan terminalden 'python3 src/retriever.py' diye çalıştırıldığında
-# yazdığımız iki arama fonksiyonunun da sorunsuz çalışıp çalışmadığını test eder.
-if __name__ == "__main__": # bu testlerin yalnızca siz bu dosyayı doğrudan çalıştırdığınızda devreye girmesini sağlar
-    print("\n" + "="*50)
-    print("🔍 1. RAG POLİTİKA ARAMASI TESTİ")
-    print("Sorgu: 'kulaklık ambalajı açılırsa iade edilir mi?'")
-    print("="*50)
-    policy_results = search_policy_documents("kulaklık ambalajı açılırsa iade edilir mi?", n_results=1)
-    for res in policy_results:
-        print(f"📄 Bulunan Belge: {res['source']}")
-        print(f"📝 İçerik: {res['content']}\n")
-
-    print("="*50)
-    print("📦 2. SQL ÜRÜN VERİTABANI ARAMASI TESTİ")
-    print("Aranan Kelime: 'kulaklık'")
-    print("="*50)
-    product_results = search_products_db("kulaklık")
-    for prod in product_results:
-        print(f"🔹 Ürün: {prod['name']}")
-        print(f"   Fiyat: {prod['price']} TL | Stok: {prod['stock']} adet")
-        print(f"   Hızlı Teslimat İlleri: {prod['fast_delivery_cities']}")
-        print(f"   Özellikler: {prod['specs']}\n")
-    print("="*50)
